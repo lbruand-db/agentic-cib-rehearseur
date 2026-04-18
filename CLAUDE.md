@@ -181,36 +181,124 @@ Add artificial events to demonstrate scenarios.
 
 **Important:** Insert the event in chronological order (sorted by timestamp).
 
-### 4. Speed Up or Slow Down Sections
+### 4. Speed Up or Slow Down Recordings
 
 Modify timestamps to change playback speed.
 
-**Task:** Adjust timestamps in a specific range to compress/expand time.
+#### Accelerate an entire recording (Python + uv)
 
-**Example - 2x speed (compress by half):**
-```
-For events between timestamp 1234570000 and 1234572000:
-- Calculate original duration: 2000ms
-- New duration: 1000ms (half)
-- Recalculate each event's timestamp proportionally
+To apply a speed factor to a gzipped rrweb recording:
+
+```bash
+uv run python -c "
+import json, gzip
+
+INPUT  = 'public/rrweb_scene1_recording.json.gz'
+OUTPUT = 'public/rrweb_scene1_recording.json.gz'  # overwrite in-place, or use a different path
+SPEED  = 2  # 2x faster; use 0.5 for 2x slower
+
+with gzip.open(INPUT, 'rt') as f:
+    data = json.load(f)
+
+start = data[0]['timestamp']
+for event in data:
+    offset = event['timestamp'] - start
+    event['timestamp'] = start + offset // SPEED
+
+with gzip.open(OUTPUT, 'wt') as f:
+    json.dump(data, f, separators=(',', ':'))
+
+print(f'Done — new duration: {round((data[-1][\"timestamp\"] - start) / 1000, 1)}s')
+"
 ```
 
-**Algorithm:**
-```javascript
-const start = 1234570000;
-const end = 1234572000;
-const speedFactor = 0.5; // 2x speed = compress to 50%
+**How it works:**
+- Every event's offset from the first timestamp is divided by `SPEED`
+- Chronological order is preserved automatically
+- Works directly on `.json.gz` files (no manual decompression needed)
 
-events.forEach(event => {
-  if (event.timestamp >= start && event.timestamp <= end) {
-    const offset = event.timestamp - start;
-    event.timestamp = start + (offset * speedFactor);
-  } else if (event.timestamp > end) {
-    // Shift all events after the range
-    event.timestamp -= (end - start) * (1 - speedFactor);
-  }
-});
+#### Accelerate a specific section only
+
+To speed up only a portion of the recording (between two timestamps), shift events after the section backward to close the gap:
+
+```python
+START_TS = 1776262900000  # beginning of section to accelerate
+END_TS   = 1776263100000  # end of section
+SPEED    = 2
+
+for event in data:
+    ts = event['timestamp']
+    if START_TS <= ts <= END_TS:
+        offset = ts - START_TS
+        event['timestamp'] = START_TS + offset // SPEED
+    elif ts > END_TS:
+        gap_saved = (END_TS - START_TS) - (END_TS - START_TS) // SPEED
+        event['timestamp'] = ts - gap_saved
 ```
+
+#### Accelerate only idle intervals
+
+Compress dead time (gaps > threshold between events) while keeping active portions at normal speed. This is the best approach for making recordings shorter without losing visible interactions.
+
+```bash
+uv run python -c "
+import json, gzip
+
+INPUT        = 'public/rrweb_scene1_recording.json.gz'
+OUTPUT       = 'public/rrweb_scene1_recording.json.gz'
+THRESHOLD_MS = 2000  # gaps larger than this are considered idle
+SPEED        = 10    # idle intervals play 10x faster
+
+with gzip.open(INPUT, 'rt') as f:
+    data = json.load(f)
+
+# Detect idle gaps between consecutive events
+idle_gaps = []
+for i in range(1, len(data)):
+    gap = data[i]['timestamp'] - data[i-1]['timestamp']
+    if gap > THRESHOLD_MS:
+        idle_gaps.append((data[i-1]['timestamp'], data[i]['timestamp'], gap))
+
+# Rebuild timestamps — compress idle gaps, leave the rest untouched
+cumulative_saved = 0
+gap_idx = 0
+
+for event in data:
+    ts = event['timestamp']
+
+    while gap_idx < len(idle_gaps):
+        g_start, g_end, g_dur = idle_gaps[gap_idx]
+        if ts < g_start:
+            break
+        if ts >= g_end:
+            cumulative_saved += g_dur - g_dur // SPEED
+            gap_idx += 1
+        else:
+            offset = ts - g_start
+            event['timestamp'] = ts - cumulative_saved - (offset - offset // SPEED)
+            break
+    else:
+        event['timestamp'] = ts - cumulative_saved
+        continue
+
+    if ts < idle_gaps[gap_idx][0] or ts >= idle_gaps[gap_idx][1]:
+        event['timestamp'] = ts - cumulative_saved
+
+with gzip.open(OUTPUT, 'wt') as f:
+    json.dump(data, f, separators=(',', ':'))
+
+start = data[0]['timestamp']
+print(f'Idle intervals: {len(idle_gaps)}')
+print(f'New duration: {round((data[-1][\"timestamp\"] - start) / 1000, 1)}s')
+"
+```
+
+**How it works:**
+- Scans consecutive events for gaps larger than `THRESHOLD_MS`
+- Each idle gap is compressed to `gap / SPEED`
+- Events inside a gap are repositioned proportionally
+- All subsequent events are shifted backward by the cumulative time saved
+- Active portions keep their original timing
 
 ### 5. Working with Large Files: TOON Format
 
